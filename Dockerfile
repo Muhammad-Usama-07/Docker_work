@@ -4,8 +4,11 @@ FROM python:3.9-slim
 # 2. Container ke andar kaam karne ki directory (folder) banayein
 WORKDIR /app
 
+# Flask install karein
+RUN pip install flask
+
 # 3. Apni Python file ko container mein copy karein
-COPY app.py .
+COPY flask_app.py .
 
 # 4. Jab container chaley toh yeh command run ho
-CMD ["python", "app.py"]
+CMD ["python", "flask_app.py"]
