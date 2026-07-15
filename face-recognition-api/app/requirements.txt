@@ -5,5 +5,4 @@ numpy
 pillow
 python-multipart
 redis
-psycopg2-binary
 python-dotenv

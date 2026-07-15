@@ -1,123 +1,143 @@
 import os
-import sys
-import base64
-import urllib.request
+import sqlite3
+import redis
+import cv2
 import numpy as np
-from flask import Flask, request, jsonify
+import base64
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.responses import JSONResponse
+from contextlib import contextmanager
+import json
+from datetime import datetime
 
-# ===== FIX: OpenCV import compatibility =====
-try:
-    import cv2
-    # Check if CascadeClassifier exists
-    if not hasattr(cv2, 'CascadeClassifier'):
-        import cv2.cv2 as cv2
-except ImportError:
-    import cv2.cv2 as cv2
+app = FastAPI(title="Face Recognition API", version="1.0")
 
-app = Flask(__name__)
+# ==================== DATABASE (SQLite) ====================
 
-def load_face_cascade():
-    """Reliably load face cascade classifier"""
-    
-    print("🔍 Looking for cascade file...")
-    
-    # Check local file first (Docker will have it)
-    local_path = 'haarcascade_frontalface_default.xml'
-    if os.path.exists(local_path) and os.path.getsize(local_path) > 1000:
-        print(f"✅ Found cascade locally: {local_path}")
-        cascade = cv2.CascadeClassifier(local_path)
-        if not cascade.empty():
-            print("✅ Cascade loaded successfully!")
-            return cascade
-    
-    # Try OpenCV's built-in path
+# Database file path
+DB_PATH = os.path.join(os.path.dirname(__file__), "data", "face.db")
+
+# Ensure data directory exists
+os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+
+@contextmanager
+def get_db():
+    """Context manager for database connections"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
     try:
-        if hasattr(cv2, 'data') and hasattr(cv2.data, 'haarcascades'):
-            builtin = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-            if os.path.exists(builtin):
-                cascade = cv2.CascadeClassifier(builtin)
-                if not cascade.empty():
-                    print(f"✅ Loaded from OpenCV: {builtin}")
-                    return cascade
+        yield conn
+    finally:
+        conn.close()
+
+def init_db():
+    """Create tables if they don't exist"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        
+        # Detection logs table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS detection_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                faces_detected INTEGER,
+                image_name TEXT,
+                file_size INTEGER,
+                detection_time REAL
+            )
+        """)
+        
+        # Users table (example for future)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        conn.commit()
+        print("✅ Database initialized successfully!")
+
+# ==================== REDIS ====================
+
+def get_redis():
+    """Get Redis connection"""
+    try:
+        r = redis.Redis(
+            host=os.getenv('REDIS_HOST', 'redis'),
+            port=int(os.getenv('REDIS_PORT', 6379)),
+            decode_responses=True,
+            socket_connect_timeout=2,
+            socket_timeout=2
+        )
+        r.ping()  # Test connection
+        return r
     except:
-        pass
-    
-    # Try older OpenCV path
-    try:
-        if hasattr(cv2, 'haarcascades'):
-            builtin = cv2.haarcascades + 'haarcascade_frontalface_default.xml'
-            if os.path.exists(builtin):
-                cascade = cv2.CascadeClassifier(builtin)
-                if not cascade.empty():
-                    print(f"✅ Loaded from OpenCV: {builtin}")
-                    return cascade
-    except:
-        pass
-    
-    # Download as last resort
-    print("📥 Downloading cascade file...")
-    url = "https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_frontalface_default.xml"
-    
-    try:
-        urllib.request.urlretrieve(url, local_path)
-        if os.path.exists(local_path) and os.path.getsize(local_path) > 1000:
-            cascade = cv2.CascadeClassifier(local_path)
-            if not cascade.empty():
-                print("✅ Downloaded and loaded successfully!")
-                return cascade
-    except Exception as e:
-        print(f"❌ Download failed: {e}")
-    
-    raise RuntimeError("Could not load face cascade classifier!")
+        print("⚠️ Redis not available, running without cache")
+        return None
 
-# Print OpenCV info for debugging
-print(f"📌 OpenCV version: {cv2.__version__}")
-print(f"📌 OpenCV location: {cv2.__file__}")
-print(f"📌 Has CascadeClassifier: {hasattr(cv2, 'CascadeClassifier')}")
+# ==================== FACE DETECTION ====================
 
-# Load the cascade
-face_cascade = load_face_cascade()
+# Load face cascade
+face_cascade = cv2.CascadeClassifier(
+    cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+)
 
-@app.route('/')
-def home():
-    return jsonify({
+# ==================== API ENDPOINTS ====================
+
+@app.on_event("startup")
+async def startup():
+    """Initialize database on startup"""
+    init_db()
+
+@app.get("/")
+async def home():
+    return {
         "message": "Face Recognition API is running!",
-        "opencv_version": cv2.__version__,
+        "docs": "/docs",
+        "database": "SQLite",
         "endpoints": {
-            "/detect": "POST - Send image and get face detection results",
-            "/health": "GET - Check API health"
+            "/detect": "POST - Send image for face detection",
+            "/health": "GET - Check API health",
+            "/logs": "GET - View detection logs"
         }
-    })
+    }
 
-@app.route('/health')
-def health():
-    return jsonify({
+@app.get("/health")
+async def health():
+    """Health check endpoint"""
+    health_status = {
         "status": "healthy",
-        "opencv_version": cv2.__version__,
-        "cascade_loaded": not face_cascade.empty()
-    })
+        "service": "face-recognition-api",
+        "database": "SQLite"
+    }
+    
+    # Check Redis
+    r = get_redis()
+    if r:
+        health_status["redis"] = "connected"
+    else:
+        health_status["redis"] = "disconnected"
+    
+    return health_status
 
-@app.route('/detect', methods=['POST'])
-def detect_faces():
+@app.post("/detect")
+async def detect_faces(file: UploadFile = File(...)):
+    """Detect faces in uploaded image"""
     try:
-        # Check if face_cascade is loaded
-        if face_cascade is None or face_cascade.empty():
-            return jsonify({"error": "Face cascade not loaded"}), 500
-        
-        # Check if image is in request
-        if 'image' not in request.files:
-            return jsonify({"error": "No image file provided"}), 400
-        
-        # Get image from request
-        file = request.files['image']
+        import time
+        start_time = time.time()
         
         # Read image
-        img_bytes = file.read()
-        nparr = np.frombuffer(img_bytes, np.uint8)
+        contents = await file.read()
+        file_size = len(contents)
+        
+        nparr = np.frombuffer(contents, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         
         if img is None:
-            return jsonify({"error": "Invalid image"}), 400
+            raise HTTPException(status_code=400, detail="Invalid image format")
         
         # Convert to grayscale
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -138,15 +158,120 @@ def detect_faces():
         _, buffer = cv2.imencode('.jpg', img)
         img_base64 = base64.b64encode(buffer).decode('utf-8')
         
-        return jsonify({
+        detection_time = time.time() - start_time
+        
+        # ===== SAVE TO SQLITE =====
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO detection_logs 
+                (faces_detected, image_name, file_size, detection_time)
+                VALUES (?, ?, ?, ?)
+                """,
+                (len(faces), file.filename, file_size, detection_time)
+            )
+            conn.commit()
+            log_id = cursor.lastrowid
+        
+        # ===== CACHE IN REDIS =====
+        r = get_redis()
+        if r:
+            cache_key = f"detection:{file.filename}:{log_id}"
+            r.setex(
+                cache_key,
+                3600,  # 1 hour
+                json.dumps({
+                    "faces_detected": len(faces),
+                    "image_name": file.filename,
+                    "detection_time": detection_time
+                })
+            )
+        
+        return {
+            "success": True,
+            "log_id": log_id,
             "faces_detected": len(faces),
-            "face_locations": [{"x": int(x), "y": int(y), "width": int(w), "height": int(h)} for (x, y, w, h) in faces],
-            "image_with_boxes": img_base64
-        })
+            "face_locations": [
+                {"x": int(x), "y": int(y), "width": int(w), "height": int(h)} 
+                for (x, y, w, h) in faces
+            ],
+            "image_with_boxes": img_base64,
+            "detection_time_ms": round(detection_time * 1000, 2),
+            "file_size_kb": round(file_size / 1024, 2)
+        }
     
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        raise HTTPException(status_code=500, detail=str(e))
 
-if __name__ == '__main__':
-    print("🚀 Starting Face Detection API...")
-    app.run(host='0.0.0.0', port=5000, debug=False)
+@app.get("/logs")
+async def get_logs(limit: int = 10):
+    """Get recent detection logs"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT id, timestamp, faces_detected, image_name, 
+                   file_size, detection_time
+            FROM detection_logs
+            ORDER BY timestamp DESC
+            LIMIT ?
+            """,
+            (limit,)
+        )
+        rows = cursor.fetchall()
+        
+        logs = []
+        for row in rows:
+            logs.append({
+                "id": row["id"],
+                "timestamp": row["timestamp"],
+                "faces_detected": row["faces_detected"],
+                "image_name": row["image_name"],
+                "file_size_kb": round(row["file_size"] / 1024, 2),
+                "detection_time_ms": round(row["detection_time"] * 1000, 2)
+            })
+        
+        return {"total": len(logs), "logs": logs}
+
+@app.delete("/logs")
+async def clear_logs():
+    """Clear all detection logs"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM detection_logs")
+        conn.commit()
+        deleted_count = cursor.rowcount
+    
+    return {"success": True, "deleted_records": deleted_count}
+
+@app.get("/stats")
+async def get_stats():
+    """Get statistics from database"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        
+        # Total detections
+        cursor.execute("SELECT COUNT(*) FROM detection_logs")
+        total_detections = cursor.fetchone()[0]
+        
+        # Total faces detected
+        cursor.execute("SELECT SUM(faces_detected) FROM detection_logs")
+        total_faces = cursor.fetchone()[0] or 0
+        
+        # Average detection time
+        cursor.execute("SELECT AVG(detection_time) FROM detection_logs")
+        avg_time = cursor.fetchone()[0] or 0
+        
+        # Last detection
+        cursor.execute(
+            "SELECT timestamp FROM detection_logs ORDER BY timestamp DESC LIMIT 1"
+        )
+        last_detection = cursor.fetchone()
+        
+        return {
+            "total_detections": total_detections,
+            "total_faces_detected": total_faces,
+            "average_detection_time_ms": round(avg_time * 1000, 2),
+            "last_detection": last_detection["timestamp"] if last_detection else None
+        }
