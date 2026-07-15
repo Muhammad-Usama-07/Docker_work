@@ -1,8 +1,7 @@
-fastapi
-uvicorn
-opencv-python-headless
-numpy
-pillow
-python-multipart
-redis
-python-dotenv
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+opencv-python==4.8.1.78
+numpy==1.24.3
+redis==5.0.1
+Pillow==10.1.0
+python-multipart==0.0.6

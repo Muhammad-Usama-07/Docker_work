@@ -9,8 +9,54 @@ from fastapi.responses import JSONResponse
 from contextlib import contextmanager
 import json
 from datetime import datetime
+import urllib.request
 
 app = FastAPI(title="Face Recognition API", version="1.0")
+
+# ==================== OPENCV FIX ====================
+
+def load_face_cascade():
+    """Robust face cascade loader for Docker"""
+    
+    # Check local file first
+    local_path = 'haarcascade_frontalface_default.xml'
+    if os.path.exists(local_path) and os.path.getsize(local_path) > 1000:
+        print(f"✅ Found cascade locally: {local_path}")
+        cascade = cv2.CascadeClassifier(local_path)
+        if not cascade.empty():
+            print("✅ Cascade loaded successfully!")
+            return cascade
+    
+    # Try OpenCV's built-in paths
+    try:
+        if hasattr(cv2, 'data') and hasattr(cv2.data, 'haarcascades'):
+            builtin = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+            if os.path.exists(builtin):
+                cascade = cv2.CascadeClassifier(builtin)
+                if not cascade.empty():
+                    print(f"✅ Loaded from OpenCV: {builtin}")
+                    return cascade
+    except:
+        pass
+    
+    # Download as last resort
+    print("📥 Downloading cascade file...")
+    url = "https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_frontalface_default.xml"
+    
+    try:
+        urllib.request.urlretrieve(url, local_path)
+        if os.path.exists(local_path) and os.path.getsize(local_path) > 1000:
+            cascade = cv2.CascadeClassifier(local_path)
+            if not cascade.empty():
+                print("✅ Downloaded and loaded successfully!")
+                return cascade
+    except Exception as e:
+        print(f"❌ Download failed: {e}")
+    
+    raise RuntimeError("Could not load face cascade classifier!")
+
+print(f"📌 OpenCV version: {cv2.__version__}")
+face_cascade = load_face_cascade()
 
 # ==================== DATABASE (SQLite) ====================
 
@@ -71,18 +117,11 @@ def get_redis():
             socket_connect_timeout=2,
             socket_timeout=2
         )
-        r.ping()  # Test connection
+        r.ping()
         return r
-    except:
-        print("⚠️ Redis not available, running without cache")
+    except Exception as e:
+        print(f"⚠️ Redis not available: {e}")
         return None
-
-# ==================== FACE DETECTION ====================
-
-# Load face cascade
-face_cascade = cv2.CascadeClassifier(
-    cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-)
 
 # ==================== API ENDPOINTS ====================
 
@@ -90,6 +129,7 @@ face_cascade = cv2.CascadeClassifier(
 async def startup():
     """Initialize database on startup"""
     init_db()
+    print("🚀 Face Recognition API started successfully!")
 
 @app.get("/")
 async def home():
@@ -97,10 +137,12 @@ async def home():
         "message": "Face Recognition API is running!",
         "docs": "/docs",
         "database": "SQLite",
+        "opencv_version": cv2.__version__,
         "endpoints": {
             "/detect": "POST - Send image for face detection",
             "/health": "GET - Check API health",
-            "/logs": "GET - View detection logs"
+            "/logs": "GET - View detection logs",
+            "/stats": "GET - View statistics"
         }
     }
 
@@ -110,7 +152,9 @@ async def health():
     health_status = {
         "status": "healthy",
         "service": "face-recognition-api",
-        "database": "SQLite"
+        "database": "SQLite",
+        "opencv_version": cv2.__version__,
+        "cascade_loaded": not face_cascade.empty()
     }
     
     # Check Redis
@@ -128,6 +172,10 @@ async def detect_faces(file: UploadFile = File(...)):
     try:
         import time
         start_time = time.time()
+        
+        # Check if cascade is loaded
+        if face_cascade is None or face_cascade.empty():
+            raise HTTPException(status_code=503, detail="Face detection not available")
         
         # Read image
         contents = await file.read()
@@ -201,6 +249,8 @@ async def detect_faces(file: UploadFile = File(...)):
             "file_size_kb": round(file_size / 1024, 2)
         }
     
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
