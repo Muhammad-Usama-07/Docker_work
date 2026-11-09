@@ -9,4 +9,5 @@ docker run -d --name flask-container -p 8080:5000 my-flask-app:v1
 Open the browser the see the app
 http://localhost:8080
 
+model deployment 
 
